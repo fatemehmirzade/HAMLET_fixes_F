@@ -31,8 +31,8 @@ except ImportError:
     from deepeval.test_case import LLMTestCaseParams
 
 
-DATA_ROOT = "/Users/fateme/Desktop/ncems_Tine_judge/NLP_train_test"
-SPLIT = "train_set"
+DATA_ROOT = "/Users/fateme/Desktop/ncems_Tine_judge/run5/NLP_train_test_5/"
+SPLIT = "train"
 SDRF_DIR = ""
 RESULTS_ROOT = "/Users/fateme/Desktop/ncems_Tine_judge/deepeval_proteomics_results"
 EVALUATION_MODEL = "google/gemma-4-31b-it"
@@ -48,6 +48,12 @@ SHOW_DEEPEVAL_BANNER = True
 THREAD_STACK_MB = 256
 MAX_RETRIES = 3
 RETRY_DELAY = 2
+TRANSIENT_MAX_RETRIES = 8
+TRANSIENT_BASE_WAIT = 10
+TRANSIENT_MAX_WAIT = 120
+ERROR_RETRY_ROUNDS = 2
+ERROR_RETRY_WAIT = 60
+RESUME = True
 CACHE_ENABLED = True
 
 PROMPT_VERSION = "proteomics_sdrf_judge_v3"
@@ -65,6 +71,8 @@ LIMIT: int | None = None
 DEDUP_MIN_CHARS = 200
 MAX_EXAMPLE_RUNS = 8
 _thread_local = threading.local()
+_FATAL_ERROR = ""
+_FATAL_LOCK = threading.Lock()
 
 #field definitions one field per kind of SDRF column
 
@@ -1343,6 +1351,55 @@ _DEGENERATE_UNICODE_PATTERN = re.compile(
 )
 
 
+_FATAL_CODES = {401, 402}
+_PERMANENT_CODES = {400, 403, 413, 422}
+
+
+def _is_fatal_message(text: str) -> bool:
+    low = (text or "").lower()
+    return any(w in low for w in ("insufficient credits", "insufficient_quota", "credit balance",
+                                  "requires more credits", "invalid api key", "no auth credentials",
+                                  "user not found"))
+
+
+def _api_error_kind(exc: Exception) -> str:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(exc, openai.AuthenticationError) or status in _FATAL_CODES \
+            or _is_fatal_message(str(exc)):
+        return "fatal"
+    if status in _PERMANENT_CODES:
+        return "permanent"
+    return "transient"
+
+
+def _response_error_kind(response) -> tuple[str, str]:
+    err = getattr(response, "error", None) if response is not None else None
+    if err is None and response is not None:
+        extra = getattr(response, "model_extra", None) or {}
+        err = extra.get("error") if isinstance(extra, dict) else None
+    code = err.get("code") if isinstance(err, dict) else getattr(err, "code", None)
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    text = str(err) if err else ""
+    if code in _FATAL_CODES or _is_fatal_message(text):
+        return "fatal", text
+    if code in _PERMANENT_CODES:
+        return "permanent", text
+    return "transient", text
+
+
+def _set_fatal(reason: str) -> None:
+    global _FATAL_ERROR
+    with _FATAL_LOCK:
+        if not _FATAL_ERROR:
+            _FATAL_ERROR = reason
+            print(f"\n  [FATAL] {reason}\n  [FATAL] stopping: no more API calls in this run\n")
+
+
 def _is_degenerate_response(text: str, expect_verdict: bool = True) -> bool:
     if not text or len(text) < 100:
         return False
@@ -1433,9 +1490,9 @@ class Gemma4OpenRouter(DeepEvalBaseLLM):
         extra_body = {"thinking": {"type": "enabled"}} if MODEL_ENABLE_THINKING else {}
         content = ""
         temperature = MODEL_TEMPERATURE
-        for attempt in range(1, MAX_RETRIES + 1):
-            wait = RETRY_DELAY * attempt
-            reason_txt = ""
+        content_attempts = transient_attempts = 0
+        while not _FATAL_ERROR:
+            reason_txt, kind = "", "content"
             try:
                 response = self.load_model().chat.completions.create(
                     model=self._model_name,
@@ -1446,7 +1503,9 @@ class Gemma4OpenRouter(DeepEvalBaseLLM):
                     timeout=REQUEST_TIMEOUT,
                 )
                 if response is None or not getattr(response, "choices", None):
-                    content, reason_txt = "", "empty/null response"
+                    kind, err_text = _response_error_kind(response)
+                    content = ""
+                    reason_txt = "empty/null response" + (f" ({err_text})" if err_text else "")
                 else:
                     content = _extract_text_content(response.choices[0].message).strip()
                     if hasattr(response, "usage") and response.usage:
@@ -1465,15 +1524,36 @@ class Gemma4OpenRouter(DeepEvalBaseLLM):
                         content, reason_txt = "", "no VERDICT line"
             except Exception as api_exc:
                 content, reason_txt = "", f"{type(api_exc).__name__}: {api_exc}"
+                kind = _api_error_kind(api_exc)
 
             if content:
                 break
-            if attempt < MAX_RETRIES:
-                print(f"  [WARNING] {reason_txt} (attempt {attempt}/{MAX_RETRIES}), "
-                      f"retrying in {wait}s...")
+            if kind == "fatal":
+                _set_fatal(reason_txt)
+                break
+            if kind == "permanent":
+                print(f"  [WARNING] {reason_txt} (not retryable), giving up.")
+                break
+            if kind == "transient":
+                transient_attempts += 1
+                if transient_attempts >= TRANSIENT_MAX_RETRIES:
+                    print(f"  [WARNING] {reason_txt} (API attempt {transient_attempts}/"
+                          f"{TRANSIENT_MAX_RETRIES}), giving up.")
+                    break
+                wait = min(TRANSIENT_MAX_WAIT, TRANSIENT_BASE_WAIT * 2 ** (transient_attempts - 1))
+                print(f"  [WARNING] {reason_txt} (API attempt {transient_attempts}/"
+                      f"{TRANSIENT_MAX_RETRIES}), retrying in {wait}s...")
                 time.sleep(wait)
-            else:
-                print(f"  [WARNING] {reason_txt} (attempt {attempt}/{MAX_RETRIES}), giving up.")
+                continue
+            content_attempts += 1
+            if content_attempts >= MAX_RETRIES:
+                print(f"  [WARNING] {reason_txt} (attempt {content_attempts}/{MAX_RETRIES}), "
+                      f"giving up.")
+                break
+            wait = RETRY_DELAY * content_attempts
+            print(f"  [WARNING] {reason_txt} (attempt {content_attempts}/{MAX_RETRIES}), "
+                  f"retrying in {wait}s...")
+            time.sleep(wait)
 
         #only cache usable responses
         if content:
@@ -2688,6 +2768,27 @@ def evaluate_paper_with_geval(paper_id: str, header: list[str], body: list[list[
                 else:
                     print(f"      [{n_done}/{len(units)}] {u['header']}: '{u['readable'][:40]}' ERROR")
 
+        for round_no in range(1, ERROR_RETRY_ROUNDS + 1):
+            failed = [i for i, r in enumerate(results) if r.get("match_type") == "ERROR"]
+            if not failed or _FATAL_ERROR:
+                break
+            print(f"    [retry round {round_no}/{ERROR_RETRY_ROUNDS}] {len(failed)} value(s) "
+                  f"without a usable answer, waiting {ERROR_RETRY_WAIT}s ...")
+            time.sleep(ERROR_RETRY_WAIT)
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {executor.submit(_run_geval_semantic, contexts[i], units[i]["kind"],
+                                           units[i].get("run_keys")): i for i in failed}
+                for future in as_completed(futures):
+                    i = futures[future]
+                    u = units[i]
+                    try:
+                        results[i] = future.result()
+                    except Exception as exc:
+                        results[i] = _error_result(f"Thread error: {exc}")
+                    r = results[i]
+                    state = f"verdict={r['verdict']}" if r.get("verdict") is not None else "ERROR"
+                    print(f"      [retry {round_no}] {u['header']}: '{u['readable'][:40]}' {state}")
+
     #per-sample values the text cannot confirm; the recovery pass below sees the verdicts
     #as the judge gave them so its requests (and the cache) are unchanged
     pre_guard_verdicts = [r.get("verdict") for r in results]
@@ -3279,10 +3380,58 @@ def discover_pxds() -> list[str]:
     return pxds
 
 
+def _read_csv_rows(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    csv.field_size_limit(10 ** 9)
+    with open(path, encoding="utf-8", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _as_number(value):
+    if not isinstance(value, str) or value == "":
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+def _load_previous_run(out_dir: str) -> dict:
+    stats = _read_csv_rows(os.path.join(out_dir, "llm_judge_per_paper.csv"))
+    review = _read_csv_rows(os.path.join(out_dir, "llm_judge_annotation_review_full.csv"))
+    reviewed = {r.get("paper_id") for r in review}
+    done = {r["paper_id"] for r in stats
+            if r.get("paper_id") in reviewed and str(r.get("judge_n_error") or "0") in ("0", "0.0")}
+    keep = lambda rows, key="paper_id": [r for r in rows if r.get(key) in done]
+    rows = keep(review)
+    for r in rows:
+        if classify_column(r.get("sdrf_column", ""))[1] == _GENERIC_FIELD:
+            r["annotation_type"] = _GENERIC_FIELD
+    return {
+        "done": done,
+        "rows": rows,
+        "stats": [{k: _as_number(v) for k, v in r.items()} for r in keep(stats)],
+        "coverage": keep(_read_csv_rows(os.path.join(out_dir, "llm_judge_coverage.csv"))),
+        "recovered": keep(_read_csv_rows(os.path.join(out_dir, "llm_judge_recovered.csv"))),
+        "filter": keep(_read_csv_rows(os.path.join(out_dir, "filtered_sdrf",
+                                                   "_filter_summary.csv")), "file_name"),
+    }
+
+
 def process_split(out_dir: str, recover: bool):
     """judge every SDRF of the split"""
     pxd_ids = discover_pxds()
     print(f"  Papers discovered: {len(pxd_ids)}")
+    previous = _load_previous_run(out_dir) if RESUME else {"done": set()}
+    if previous["done"]:
+        before = len(pxd_ids)
+        pxd_ids = [p for p in pxd_ids if p not in previous["done"]]
+        print(f"  Resume: {before - len(pxd_ids)} paper(s) already judged without errors are "
+              f"kept, {len(pxd_ids)} paper(s) to judge")
     n_papers = len(pxd_ids)
 
     review_csv = _IncrementalCSV(os.path.join(out_dir, "llm_judge_annotation_review.csv"),
@@ -3310,8 +3459,21 @@ def process_split(out_dir: str, recover: bool):
     print()
 
     all_rows, all_cov_rows, all_rec_rows, per_file_stats, skipped = [], [], [], [], []
+    if previous["done"]:
+        review_csv.append_rows(previous["rows"] and _review_rows(previous["rows"]))
+        review_full_csv.append_rows(previous["rows"] and _review_rows(previous["rows"]))
+        stats_csv.append_rows(previous["stats"])
+        coverage_csv.append_rows(previous["coverage"])
+        recovered_csv.append_rows(previous["recovered"])
+        filter_csv.append_rows(previous["filter"])
+        all_rows.extend(previous["rows"])
+        all_cov_rows.extend(previous["coverage"])
+        all_rec_rows.extend(previous["recovered"])
+        per_file_stats.extend(previous["stats"])
 
     for paper_idx, pxd_id in enumerate(pxd_ids, 1):
+        if _FATAL_ERROR:
+            break
         t_start = time.time()
         print(f"  PAPER [{paper_idx}/{n_papers}]: {pxd_id}")
 
@@ -3333,6 +3495,9 @@ def process_split(out_dir: str, recover: bool):
         print(f"    SDRF loaded: {sdrf_path}")
 
         result = evaluate_paper_with_geval(pxd_id, header, body, source_text, recover)
+        if _FATAL_ERROR:
+            print(f"    NOT WRITTEN: {pxd_id} stopped by an API error that retries cannot fix")
+            break
         eval_rows = result["eval_rows"]
 
         coverage_csv.append_rows(result["coverage_rows"])
@@ -3384,6 +3549,11 @@ def process_split(out_dir: str, recover: bool):
         w.append_rows(skipped)
         w.close()
 
+    if _FATAL_ERROR:
+        print(f"\n  RUN STOPPED EARLY: {_FATAL_ERROR}")
+        print("  Fix the API key or credits and run the same command again; papers already "
+              "written are kept and the rest continue from where this run stopped.\n")
+
     df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     per_paper_df = pd.DataFrame(per_file_stats) if per_file_stats else pd.DataFrame()
     per_field_df = pd.DataFrame(per_field) if per_field else pd.DataFrame()
@@ -3405,7 +3575,7 @@ def _plots_from_csv(out_dir: str) -> None:
 def main():
     """parse command line arguments and run the full evaluation pipeline"""
     global DATA_ROOT, SPLIT, SDRF_DIR, USE_LLM_JUDGE, LIMIT, MAX_WORKERS, CACHE_ENABLED
-    global ONLY_PXDS, _JUDGE_CACHE_DIR, _judge_model
+    global ONLY_PXDS, _JUDGE_CACHE_DIR, _judge_model, RESUME
 
     #a crash prints the Python stack instead of a bare "segmentation fault"
     faulthandler.enable()
@@ -3426,8 +3596,8 @@ Examples:
   --plots-only --outdir test_3
 """)
     parser.add_argument("--data-root", default=None, help=f"default: {DATA_ROOT}")
-    parser.add_argument("--split", default=None, choices=["train_set", "test_set"],
-                        help=f"default: {SPLIT}")
+    parser.add_argument("--split", default=None,
+                        help=f"split folder under the data root, e.g. train or test (default: {SPLIT})")
     parser.add_argument("--sdrf-dir", default=None,
                         help="folder with the SDRF files to judge (default: the split folder)")
     parser.add_argument("--outdir", default=None,
@@ -3440,6 +3610,8 @@ Examples:
     parser.add_argument("--limit", type=int, default=None, help="Limit to first N papers")
     parser.add_argument("--workers", type=int, default=None,
                         help=f"Max parallel LLM calls (default: {MAX_WORKERS})")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="judge every paper again instead of keeping finished ones in --outdir")
     parser.add_argument("--plots-only", action="store_true",
                         help="redraw the plots from the CSVs in --outdir, no judging")
     args = parser.parse_args()
@@ -3455,6 +3627,8 @@ Examples:
         MAX_WORKERS = args.workers
     if args.no_cache:
         CACHE_ENABLED = False
+    if args.no_resume:
+        RESUME = False
     if args.only:
         ONLY_PXDS = [p for item in args.only for p in item.split(",") if p.strip()]
     recover = RECOVER_MISSED and not args.no_recover
