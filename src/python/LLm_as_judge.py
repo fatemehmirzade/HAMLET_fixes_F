@@ -1817,7 +1817,8 @@ def write_sdrf(path: str, header: list[str], body: list[list[str]]) -> None:
         writer.writerows(body)
 
 
-def _run_keys(header: list[str], body: list[list[str]]) -> tuple[list[str], list[str]]:
+def _run_keys(header: list[str], body: list[list[str]],
+              skip_placeholders: bool = True) -> tuple[list[str], list[str]]:
     """a unique key per run (data file name else assay name else row number) and a label"""
     keys_h = [_sdrf_header_key(h) for h in header]
 
@@ -1829,7 +1830,8 @@ def _run_keys(header: list[str], body: list[list[str]]) -> tuple[list[str], list
     for idx in (i_file, i_assay):
         if idx is not None:
             cand = [r[idx].strip() for r in body]
-            if all(cand) and len(set(cand)) == len(cand):
+            if (all(cand) and not (skip_placeholders and any(_is_not_extracted(c) for c in cand))
+                    and len(set(cand)) == len(cand)):
                 keys = cand
                 break
     if keys is None:
@@ -2714,7 +2716,7 @@ def evaluate_paper_with_geval(paper_id: str, header: list[str], body: list[list[
     paper_canon_lower = _canon(source_text).lower()
     units, columns = build_units(header, body)
     field_values = _column_values(columns)
-    _, run_labels = _run_keys(header, body)
+    _, run_labels = _run_keys(header, body, skip_placeholders=False)
     n_runs = len(body)
 
     coverage_rows = []
@@ -2869,6 +2871,11 @@ def _review_rows(eval_rows: list[dict]) -> list[dict]:
         row = dict(r)
         if row.get("annotation_type") == _GENERIC_FIELD:
             row["annotation_type"] = row.get("sdrf_column", _GENERIC_FIELD)
+        if row.get("kind") == "runs" and str(row.get("n_runs", "")) in ("1", "1.0"):
+            for k in ("extracted_value", "corrected_value"):
+                v = str(row.get(k) or "")
+                if "|" not in v and re.match(r"^[^=|]+? = ", v):
+                    row[k] = v.split(" = ", 1)[1].strip()
         out.append(row)
     return out
 
@@ -3404,8 +3411,36 @@ def _load_previous_run(out_dir: str) -> dict:
     stats = _read_csv_rows(os.path.join(out_dir, "llm_judge_per_paper.csv"))
     review = _read_csv_rows(os.path.join(out_dir, "llm_judge_annotation_review_full.csv"))
     reviewed = {r.get("paper_id") for r in review}
+    placeholder_key = {r.get("paper_id") for r in review
+                       if r.get("kind") == "runs"
+                       and _is_not_extracted(str(r.get("extracted_value") or "").split(" = ", 1)[0])
+                       and " = " in str(r.get("extracted_value") or "")}
     done = {r["paper_id"] for r in stats
-            if r.get("paper_id") in reviewed and str(r.get("judge_n_error") or "0") in ("0", "0.0")}
+            if r.get("paper_id") in reviewed and str(r.get("judge_n_error") or "0") in ("0", "0.0")
+            and r.get("paper_id") not in placeholder_key}
+    if placeholder_key:
+        print(f"  Resume: {len(placeholder_key)} paper(s) judged with the run key 'not available' "
+              f"are judged again")
+    changed = set()
+    for pxd in done:
+        result_json = os.path.join(out_dir, "json_outputs", f"{pxd}.json")
+        sdrf = find_sdrf(pxd)
+        if (sdrf is not None and os.path.exists(result_json)
+                and os.path.getmtime(sdrf) > os.path.getmtime(result_json)):
+            changed.add(pxd)
+    only = {p.strip().upper() for p in ONLY_PXDS}
+    if only:
+        changed &= only
+        forced = only & done
+        done = {r["paper_id"] for r in stats if r.get("paper_id") in reviewed} - only
+    else:
+        forced = set()
+        done -= changed
+    if changed:
+        print(f"  Resume: {len(changed)} paper(s) have a newer SDRF than their results and are "
+              f"judged again")
+    if forced - changed:
+        print(f"  Resume: {len(forced - changed)} paper(s) given with --only are judged again")
     keep = lambda rows, key="paper_id": [r for r in rows if r.get(key) in done]
     rows = keep(review)
     for r in rows:
